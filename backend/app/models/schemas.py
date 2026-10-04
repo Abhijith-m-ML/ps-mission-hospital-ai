@@ -359,11 +359,16 @@ class ChatRequest(BaseModel):
         default="en-IN",
         description="Language code: 'en-IN', 'ml-IN', 'hi-IN', or 'auto'",
     )
+    debug: Optional[bool] = Field(
+        default=False,
+        description="Enable development debug pipeline trace in response",
+    )
 
 
 class VoiceTranscribeResponse(BaseModel):
     """Transcription response from Gemini speech-to-text."""
     text: str = Field(..., description="Transcribed query text")
+    transcript: Optional[str] = Field(default=None, description="Transcribed query text alias")
     language: str = Field(default="en-IN", description="Detected or requested language code (en-IN, ml-IN, hi-IN)")
 
 
@@ -380,6 +385,8 @@ class ChatResponse(BaseModel):
     source_ids: List[str] = Field(default_factory=list, description="Explicit chunk IDs cited in the answer")
     session_id: Optional[str] = Field(default=None, description="Echoed session identifier")
     resolved_query: Optional[str] = Field(default=None, description="Context-resolved standalone question used for retrieval")
+    raw_transcript: Optional[str] = Field(default=None, description="Original raw transcript from voice or text input")
+    debug_pipeline: Optional[Dict[str, Any]] = Field(default=None, description="Detailed development diagnostics trace when debug mode is enabled")
 
 
 
@@ -485,6 +492,27 @@ class StructuredPreviewResponse(BaseModel):
     total_doctors: int = 0
     total_facilities: int = 0
     total_images: int = 0
+
+
+class QueryPreviewRequest(BaseModel):
+    """Payload to debug and preview query normalization, intent detection, and rewriting."""
+    message: str = Field(..., min_length=1, max_length=1000, description="Raw query message from user")
+    history: Optional[List[ChatMessage]] = Field(
+        default_factory=list,
+        description="Recent conversation turns for contextual follow-up resolution",
+    )
+
+
+class QueryPreviewResponse(BaseModel):
+    """Structured debug response from the Query Understanding and Rewriting layer."""
+    original_query: str = Field(..., description="Original raw question string")
+    raw_query: Optional[str] = Field(default=None, description="Raw question string")
+    resolved_query: str = Field(..., description="Clean, canonical rewritten retrieval query")
+    normalized_query: Optional[str] = Field(default=None, description="Clean, canonical rewritten retrieval query")
+    intent: str = Field(..., description="Detected hospital inquiry intent")
+    entities: Dict[str, Any] = Field(default_factory=dict, description="Extracted and fuzzy-matched entities")
+    confidence: float = Field(default=1.0, description="Classification confidence score")
+
 
 
 

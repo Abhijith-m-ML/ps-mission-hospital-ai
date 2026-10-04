@@ -32,6 +32,7 @@ def chat_endpoint(request: ChatRequest) -> ChatResponse:
             history=request.history,
             session_id=request.session_id,
             language=request.language,
+            debug=getattr(request, "debug", False),
         )
         return response
 

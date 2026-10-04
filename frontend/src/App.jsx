@@ -27,7 +27,7 @@ export default function App() {
     {
       id: 1,
       sender: 'ai',
-      text: "Hello! Welcome to P.S. Mission Hospital's AI Assistant. I can help you find department information, check visiting hours, doctor services, and hospital guidelines based on verified records. How may I assist you today?",
+      text: "Hello! Welcome to P.S. Mission Hospital's AI Assistant. I can help you find department information, doctor services, OPD consultation timings, and hospital guidelines based on verified records. How may I assist you today?",
       timestamp: formatTime(),
       sources: [],
     },

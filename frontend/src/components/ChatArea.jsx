@@ -22,9 +22,6 @@ export default function ChatArea({ messages, isTyping }) {
             <h2 className="text-base sm:text-lg font-bold text-slate-900">
               Welcome to P.S. Mission Hospital Assistant
             </h2>
-            <p className="text-xs sm:text-sm text-slate-600">
-              Your automated guide to hospital facilities, clinical departments, visiting hours, and appointments.
-            </p>
           </div>
         </div>
 

@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -255,6 +256,7 @@ class RAGService:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         namespace: Optional[str] = None,
+        debug: Optional[bool] = False,
     ) -> ChatResponse:
         """Processes patient question, resolves conversational follow-ups, retrieves factual
         context, queries hosted LLM, and returns grounded answer with source citations.
@@ -267,9 +269,11 @@ class RAGService:
             top_k: Number of chunks to retrieve.
             min_score: Minimum similarity score cutoff.
             namespace: Hospital namespace partition.
+            debug: Optional flag to return detailed development diagnostics.
             
         Returns:
-            ChatResponse: Pydantic model with answer string, sources, session_id, and resolved_query.
+            ChatResponse: Pydantic model with answer string, sources, session_id, resolved_query,
+                          raw_transcript, and optional debug_pipeline trace.
         """
         start_time = time.time()
         clean_msg = (message or "").strip()
@@ -288,14 +292,35 @@ class RAGService:
         resolved_query = resolution.resolved_query
 
         # 3. Retrieve Candidate Chunks & Assemble Grounded Context
+        # Enforce IMPORTANT RETRIEVAL RULE:
+        # Only apply department filters when the intent actually requires a department.
+        effective_department = resolution.department
+        intents_without_dept = {
+            "contact_information",
+            "hospital_hours",
+            "location",
+            "emergency_information",
+            "services",
+            "general_hospital_information",
+            "insurance",
+            "general_question",
+        }
+        dept_in_query = bool(resolution.entities.get("department")) if hasattr(resolution, "entities") else False
+        if str(resolution.intent).lower() in intents_without_dept and not dept_in_query:
+            effective_department = None
+
+        entities_dict = getattr(resolution, "entities", {})
+        if str(resolution.intent).lower() == "symptom_to_department" and not effective_department:
+            effective_department = entities_dict.get("inferred_department")
+
         retrieval_filters = {
-            "department": resolution.department,
+            "department": effective_department,
             "doctor": resolution.target_doctor,
             "intent": resolution.intent,
         }
         retrieval_response = self.retriever.retrieve(
             query=resolved_query,
-            department=resolution.department,
+            department=effective_department,
             doctor_name=resolution.target_doctor,
             intent=resolution.intent,
             top_k=top_k,
@@ -304,38 +329,78 @@ class RAGService:
         )
 
         # 4. Compute Diagnostic Counts (No secrets logged)
-        num_pinecone_results = len([
+        structured_result_count = len([
+            r for r in (retrieval_response.results or [])
+            if r.source != "website"
+        ])
+        semantic_result_count = len([
             r for r in (retrieval_response.results or [])
             if r.source == "website"
         ])
-        num_doctor_results = len([
-            r for r in (retrieval_response.results or [])
-            if (r.metadata or {}).get("content_type") == "doctor"
-        ])
+        final_context_count = len(retrieval_response.results or [])
 
-        # Format last 5 conversation messages safely for logging
-        last_5_messages = [
-            {
-                "role": m.role,
-                "content": (m.content[:80] + "..." if len(m.content) > 80 else m.content)
-            }
-            for m in (history or [])[-5:]
+        # Check debug mode
+        is_debug = bool(
+            debug
+            or settings.DEBUG_QUERY_PIPELINE
+            or os.getenv("DEBUG_QUERY_PIPELINE", "false").lower() in ("true", "1")
+        )
+
+        pinecone_results_preview = [
+            {"id": r.chunk_id, "score": round(r.score, 4), "section": r.section, "source": r.source}
+            for r in (retrieval_response.results or [])
+            if r.source == "website"
         ]
 
+        # Development query diagnostics in required format
         logger.info("==================================================")
-        logger.info("CHAT INVOCATION DIAGNOSTICS:")
-        logger.info("1. session_id: %s", session_id or "anonymous")
-        logger.info("2. current user message: '%s'", clean_msg)
-        logger.info("3. target language: %s (requested: %s)", target_lang, language)
-        logger.info("4. number of history messages received by backend: %d", len(history or []))
-        logger.info("5. last 5 conversation messages: %s", json.dumps(last_5_messages))
-        logger.info("6. resolved query: '%s'", resolved_query)
-        logger.info("7. detected intent: %s", resolution.intent)
-        logger.info("8. detected department: %s", resolution.department)
-        logger.info("9. retrieval filters: %s", json.dumps(retrieval_filters))
-        logger.info("10. number of Pinecone results: %d", num_pinecone_results)
-        logger.info("11. number of structured doctor results: %d", num_doctor_results)
+        logger.info("DEVELOPMENT QUERY DIAGNOSTICS:")
+        logger.info("RAW USER INPUT:\n%s", clean_msg)
+        logger.info("DETECTED LANGUAGE:\n%s", getattr(resolution, "language", target_lang))
+        logger.info("NORMALIZED QUERY:\n%s", resolved_query)
+        logger.info("INTENT:\n%s", resolution.intent)
+        logger.info("ENTITIES:\n%s", json.dumps(entities_dict))
+        logger.info("RETRIEVAL QUERY:\n%s", resolved_query)
+        logger.info("FILTERS:\n%s", json.dumps(retrieval_filters))
+        logger.info("PINECONE RESULTS:\n%s", json.dumps(pinecone_results_preview))
+        logger.info("FINAL CONTEXT:\n%s", retrieval_response.context.context_text[:500] if retrieval_response.context else "None")
+        logger.info("raw_query: '%s'", clean_msg)
+        logger.info("conversation_history_used: %s", resolution.used_conversation_context)
+        logger.info("department: %s", effective_department)
+        logger.info("doctor: %s", resolution.target_doctor)
+        logger.info("facility: %s", entities_dict.get("facility"))
+        logger.info("Pinecone result count: %d", semantic_result_count)
+        logger.info("structured result count: %d", structured_result_count)
+        logger.info("final context count: %d", final_context_count)
+        logger.info("session_id: %s", session_id or "anonymous")
+        logger.info("target_language: %s (requested: %s)", target_lang, language)
         logger.info("==================================================")
+
+        debug_pipeline_data = None
+        if is_debug:
+            retrieved_docs = [
+                {
+                    "chunk_id": r.chunk_id,
+                    "score": round(r.score, 4),
+                    "section": r.section,
+                    "title": r.title,
+                    "source": r.source,
+                    "url": r.url,
+                    "content": r.content[:200] if r.content else "",
+                }
+                for r in (retrieval_response.results or [])
+            ]
+            debug_pipeline_data = {
+                "raw_transcript": clean_msg,
+                "language": getattr(resolution, "language", target_lang),
+                "normalized_query": resolved_query,
+                "intent": str(resolution.intent),
+                "entities": entities_dict,
+                "retrieval_query": resolved_query,
+                "filters": retrieval_filters,
+                "retrieved_documents": retrieved_docs,
+                "final_context": retrieval_response.context.context_text if retrieval_response.context else "",
+            }
 
         # 5. Check No-Context Behavior
         no_ctx_reply = get_no_context_reply(target_lang)
@@ -347,6 +412,8 @@ class RAGService:
                 source_ids=[],
                 session_id=session_id,
                 resolved_query=resolved_query,
+                raw_transcript=clean_msg,
+                debug_pipeline=debug_pipeline_data,
             )
 
         context_text = retrieval_response.context.context_text.strip()
@@ -358,6 +425,8 @@ class RAGService:
                 source_ids=[],
                 session_id=session_id,
                 resolved_query=resolved_query,
+                raw_transcript=clean_msg,
+                debug_pipeline=debug_pipeline_data,
             )
 
         # 6. Build Grounded Prompt with History and Grounded Context
@@ -449,5 +518,7 @@ class RAGService:
             source_ids=final_source_ids,
             session_id=session_id,
             resolved_query=resolved_query,
+            raw_transcript=clean_msg,
+            debug_pipeline=debug_pipeline_data,
         )
 

@@ -10,6 +10,7 @@ from app.api.chat import router as chat_router
 from app.api.extract import router as extract_router
 from app.api.structured import router as structured_router
 from app.api.voice import router as voice_router
+from app.api.query import router as query_router
 
 api_router = APIRouter()
 api_router.include_router(health_router)
@@ -23,6 +24,7 @@ api_router.include_router(chat_router)
 api_router.include_router(extract_router)
 api_router.include_router(structured_router)
 api_router.include_router(voice_router)
+api_router.include_router(query_router)
 
 
 

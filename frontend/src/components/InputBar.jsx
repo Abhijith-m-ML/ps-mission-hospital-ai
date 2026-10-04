@@ -23,6 +23,7 @@ export default function InputBar({
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   const streamRef = useRef(null);
+  const recordingStartTimeRef = useRef(null);
 
   // Clean up media streams on unmount
   useEffect(() => {
@@ -47,10 +48,11 @@ export default function InputBar({
     }
   };
 
-  // Start microphone recording
+  // Start microphone recording with optimized audio constraints
   const startRecording = async () => {
     setErrorMessage('');
     audioChunksRef.current = [];
+    recordingStartTimeRef.current = Date.now();
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setErrorMessage('Audio recording is not supported in this browser.');
@@ -59,18 +61,44 @@ export default function InputBar({
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      let stream;
+      try {
+        // High-clarity audio recording constraints: mono, 16kHz, noise suppression & echo cancellation
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            sampleRate: 16000,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+      } catch (constraintErr) {
+        console.warn('Audio constraints not fully supported, falling back to basic audio:', constraintErr);
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+
       streamRef.current = stream;
 
-      let mimeType = 'audio/webm;codecs=opus';
-      if (!MediaRecorder.isTypeSupported(mimeType)) {
-        mimeType = 'audio/webm';
-        if (!MediaRecorder.isTypeSupported(mimeType)) {
-          mimeType = '';
+      const candidateMimes = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/mp4',
+        '',
+      ];
+      let selectedMime = '';
+      for (const m of candidateMimes) {
+        if (!m || (window.MediaRecorder && MediaRecorder.isTypeSupported(m))) {
+          selectedMime = m;
+          break;
         }
       }
 
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const recorder = new MediaRecorder(
+        stream,
+        selectedMime ? { mimeType: selectedMime, audioBitsPerSecond: 64000 } : undefined
+      );
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (event) => {
@@ -83,7 +111,10 @@ export default function InputBar({
         // Stop audio tracks
         stream.getTracks().forEach((track) => track.stop());
 
-        if (audioChunksRef.current.length === 0) {
+        const durationMs = Date.now() - (recordingStartTimeRef.current || 0);
+
+        if (audioChunksRef.current.length === 0 || durationMs < 400) {
+          // Accidental click or zero audio collected
           setVoiceState('idle');
           return;
         }
@@ -91,6 +122,11 @@ export default function InputBar({
         const audioBlob = new Blob(audioChunksRef.current, {
           type: recorder.mimeType || 'audio/webm',
         });
+
+        if (audioBlob.size < 400) {
+          setVoiceState('idle');
+          return;
+        }
 
         // Trigger STT transcription
         await handleTranscribe(audioBlob);
@@ -309,7 +345,7 @@ export default function InputBar({
                   ? 'ചോദ്യങ്ങൾ മലയാളത്തിൽ ചോദിക്കൂ...'
                   : selectedLanguage === 'hi-IN'
                   ? 'अस्पताल के बारे में यहाँ पूछें...'
-                  : 'Ask about hospital services, doctors, visiting hours...'
+                  : 'Ask about hospital services, doctors, OPD timings...'
               }
               className="w-full pl-4 pr-10 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 transition placeholder-slate-400 text-slate-800 disabled:opacity-60"
             />

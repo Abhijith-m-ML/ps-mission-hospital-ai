@@ -3,7 +3,6 @@ import { Sparkles } from 'lucide-react';
 
 const SUGGESTIONS = [
   "Tell me about Cardiology",
-  "What are the hospital visiting hours?",
   "Which services are available for children?",
   "How can I contact the hospital?",
 ];

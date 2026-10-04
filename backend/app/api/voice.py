@@ -42,6 +42,7 @@ async def transcribe_voice(
 
         return VoiceTranscribeResponse(
             text=text,
+            transcript=text,
             language=detected_lang,
         )
 

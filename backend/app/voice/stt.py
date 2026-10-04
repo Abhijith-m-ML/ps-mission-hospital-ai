@@ -86,26 +86,31 @@ class GeminiSTT:
         lang_norm = (language or "").strip().lower()
         if lang_norm in ("ml-in", "ml", "malayalam"):
             prompt = (
-                "Please transcribe the spoken Malayalam speech in this audio accurately into Malayalam script (മലയാളം ലിപിയിൽ). "
-                "Return ONLY the exact transcribed text verbatim without any introductory comments, formatting, or quotes."
+                "You are an expert audio speech-to-text transcribing system for hospital and medical inquiries. "
+                "The user is speaking Malayalam (മലയാളം), which may be pure Malayalam, colloquial Malayalam, or mixed Malayalam and English (Manglish) with medical symptoms or doctor names. "
+                "Transcribe the spoken audio verbatim and accurately. Use Malayalam script (മലയാളം ലിപിയിൽ) for Malayalam words and English script for English words/acronyms (e.g. OP, doctor, Cardiology, leg pain). "
+                "Do not summarize, do not translate, do not add notes. Return ONLY the transcribed text verbatim."
             )
         elif lang_norm in ("hi-in", "hi", "hindi"):
             prompt = (
-                "Please transcribe the spoken Hindi speech in this audio accurately into Devanagari script (देवनागरी लिपि में). "
-                "Return ONLY the exact transcribed text verbatim without any introductory comments, formatting, or quotes."
+                "You are an expert audio speech-to-text transcribing system for hospital inquiries. "
+                "The user is speaking Hindi (हिन्दी), which may include English medical terms or doctor names. "
+                "Transcribe the spoken audio verbatim and accurately into Devanagari script (देवनागरी लिपि में), using English script for English medical words if spoken. "
+                "Do not summarize, do not translate, do not add notes. Return ONLY the transcribed text verbatim."
             )
         elif lang_norm in ("en-in", "en", "english"):
             prompt = (
-                "Please transcribe the spoken English speech in this audio accurately. "
-                "Return ONLY the exact transcribed text verbatim without any introductory comments, formatting, or quotes."
+                "You are an expert audio speech-to-text transcribing system for hospital inquiries. "
+                "The user is speaking Indian English, which may include Indian doctor names, hospital departments, and medical symptoms. "
+                "Transcribe the spoken English audio verbatim and accurately without changing any words or symptoms. "
+                "Do not summarize, do not add notes. Return ONLY the transcribed text verbatim."
             )
         else:
             prompt = (
-                "Please accurately transcribe the spoken speech in this audio. "
-                "If the speech is Malayalam, transcribe in Malayalam script. "
-                "If Hindi, transcribe in Devanagari script. "
-                "If English, transcribe in English. "
-                "Return ONLY the transcribed text verbatim without any notes, formatting, or quotes."
+                "You are an expert audio speech-to-text transcribing system for hospital inquiries. "
+                "The user may speak in Malayalam, English, Hindi, or a mix (such as Manglish or Hinglish). "
+                "Accurately transcribe the spoken audio verbatim: transcribe Malayalam in Malayalam script, Hindi in Devanagari script, and English/medical terms in English script. "
+                "Do not summarize, do not translate, do not add notes. Return ONLY the transcribed text verbatim."
             )
 
         payload = {

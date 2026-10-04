@@ -14,6 +14,7 @@ from app.models.schemas import (
 )
 from app.retrieval.entity_store import HospitalEntityStore
 from app.retrieval.intent_analyzer import IntentAnalyzer, QueryIntent
+from app.retrieval.reranker import LightweightReranker
 from app.retrieval.retriever import Retriever
 
 
@@ -35,10 +36,12 @@ class StructuredRetriever:
         entity_store: Optional[HospitalEntityStore] = None,
         intent_analyzer: Optional[IntentAnalyzer] = None,
         semantic_retriever: Optional[Retriever] = None,
+        reranker: Optional[LightweightReranker] = None,
     ):
         self.entity_store = entity_store or HospitalEntityStore()
         self.intent_analyzer = intent_analyzer or IntentAnalyzer(self.entity_store)
         self.semantic_retriever = semantic_retriever or Retriever()
+        self.reranker = reranker or LightweightReranker()
 
     def retrieve_doctors(
         self,
@@ -91,15 +94,45 @@ class StructuredRetriever:
         parsed_intent = self.intent_analyzer.analyze(clean_query)
 
         # Apply explicit entity and intent overrides if provided from resolution
-        if department:
+        if intent:
+            intent_lower = str(intent).lower()
+            if intent_lower in ("doctor_search",):
+                parsed_intent.intent = QueryIntent.DOCTOR_SEARCH
+            elif intent_lower in ("doctor_schedule", "schedule_search"):
+                parsed_intent.intent = QueryIntent.SCHEDULE_SEARCH
+            elif intent_lower in ("facility_information", "facility_search"):
+                parsed_intent.intent = QueryIntent.FACILITY_SEARCH
+            elif intent_lower in ("department_information", "department_search"):
+                parsed_intent.intent = QueryIntent.DEPARTMENT_SEARCH
+            elif intent_lower in ("symptom_to_department",):
+                # When department is identified for symptom, search doctors in that department
+                parsed_intent.intent = QueryIntent.DOCTOR_SEARCH
+            else:
+                try:
+                    parsed_intent.intent = QueryIntent(intent)
+                except ValueError:
+                    parsed_intent.intent = QueryIntent.GENERAL_RAG
+
+        # Enforce IMPORTANT RETRIEVAL RULE:
+        # Only apply department filters when the intent actually requires a department.
+        NO_DEPARTMENT_INTENTS = {
+            "contact_information",
+            "hospital_hours",
+            "location",
+            "emergency_information",
+            "services",
+            "general_hospital_information",
+            "insurance",
+            "general_question",
+        }
+        raw_intent_str = str(intent).lower() if intent else ""
+        if raw_intent_str in NO_DEPARTMENT_INTENTS:
+            parsed_intent.department = None
+        elif department:
             parsed_intent.department = department
+
         if doctor_name:
             parsed_intent.doctor_name = doctor_name
-        if intent:
-            try:
-                parsed_intent.intent = QueryIntent(intent)
-            except ValueError:
-                pass
 
         logger.info(
             "StructuredRetriever: intent=%s, dept='%s', doctor='%s'",
@@ -185,8 +218,33 @@ class StructuredRetriever:
             **kwargs,
         )
 
-        # If semantic search found nothing but a department was detected, fallback to department overview
-        if not semantic_res.has_context and parsed_intent.department:
+        # Apply reranking to semantic candidate chunks
+        if semantic_res.results and self.reranker:
+            rerank_entities = {}
+            if parsed_intent.intent in (QueryIntent.DOCTOR_SEARCH, QueryIntent.SCHEDULE_SEARCH):
+                if parsed_intent.doctor_name:
+                    rerank_entities["doctor"] = parsed_intent.doctor_name
+                if parsed_intent.department:
+                    rerank_entities["department"] = parsed_intent.department
+            elif parsed_intent.intent in (QueryIntent.DEPARTMENT_SEARCH, QueryIntent.FACILITY_SEARCH):
+                if parsed_intent.department:
+                    rerank_entities["department"] = parsed_intent.department
+
+            reranked_chunks = self.reranker.rerank(
+                query=clean_query,
+                chunks=semantic_res.results,
+                entities=rerank_entities,
+            )
+            semantic_res.results = reranked_chunks
+            context_res = self.semantic_retriever.context_builder.build_context(reranked_chunks)
+            semantic_res.context = context_res
+
+        # Fallback to structured department info ONLY for department-specific intents
+        if (
+            not semantic_res.has_context
+            and parsed_intent.department
+            and parsed_intent.intent in (QueryIntent.DEPARTMENT_SEARCH, QueryIntent.FACILITY_SEARCH, QueryIntent.DOCTOR_SEARCH)
+        ):
             dept = self.retrieve_department(parsed_intent.department)
             if dept and dept.description:
                 logger.info("Falling back to structured department info for '%s'", parsed_intent.department)

@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_OUTPUT_TOKENS: int = 800
     MAX_HISTORY_MESSAGES: int = 10
+    DEBUG_QUERY_PIPELINE: bool = False
     BACKEND_CORS_ORIGINS: Union[List[str], str] = [
 
         "http://localhost:5173",
