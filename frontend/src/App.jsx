@@ -165,6 +165,7 @@ export default function App() {
       message: text,
       language: language || selectedLanguage || 'en-IN',
       history: historyPayload,
+      input_type: isVoice ? 'voice' : 'text',
     };
 
     try {

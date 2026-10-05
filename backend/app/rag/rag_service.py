@@ -14,6 +14,7 @@ from app.rag.prompts import (
 )
 from app.retrieval.query_resolver import QueryResolver
 from app.retrieval.structured_retriever import StructuredRetriever
+from app.services.llm_router import LLMRouter, get_llm_router
 from app.voice.language import resolve_language
 
 
@@ -134,13 +135,51 @@ def deduplicate_sources(sources: List[SourceItem]) -> List[SourceItem]:
     return final_sources
 
 
+def _clean_internal_rag_language(text: str) -> str:
+    """Removes internal database and retrieval terminology from patient answers (Rule 3 & Rule 1)."""
+    if not text:
+        return ""
+    replacements = [
+        (r"\bthe provided records list\b", "the hospital lists"),
+        (r"\bprovided records\b", "hospital records"),
+        (r"\bavailable records\b", "available hospital information"),
+        (r"\bretrieved context\b", "available information"),
+        (r"\bretrieved documents\b", "hospital information"),
+        (r"\bretrieved chunks\b", "hospital information"),
+        (r"\baccording to the retrieved (?:documents|records|context|chunks)\b", "according to the hospital's available information"),
+        (r"\bthe provided context\b", "the hospital's information"),
+        (r"\bPinecone\b", "hospital database"),
+        (r"\bvector database\b", "hospital records"),
+        (r"\bknowledge base retrieved\b", "hospital information"),
+    ]
+    cleaned = text
+    for pattern, repl in replacements:
+        cleaned = re.sub(pattern, repl, cleaned, flags=re.IGNORECASE)
+
+    # Clean up accidental self-contradictions if model started with
+    # "I couldn't find that information in the available hospital information. However, the hospital lists..."
+    contradiction_patterns = [
+        r"^I couldn't find that information in the available hospital information\.\s*(?:While|However|Although|But),?\s*",
+        r"^I couldn't find that information in the available hospital information\.\s*(?:The hospital lists|The available hospital information lists|Here are)",
+    ]
+    for cp in contradiction_patterns:
+        m = re.search(cp, cleaned, flags=re.IGNORECASE)
+        if m:
+            cleaned = cleaned[m.end():]
+            if cleaned:
+                cleaned = cleaned[0].upper() + cleaned[1:]
+            break
+
+    return cleaned.strip()
+
+
 def parse_llm_response(
     raw_output: str,
     retrieved_chunks: List[RetrievalChunkItem],
 ) -> Tuple[str, List[str]]:
-    """Extracts answer text and cited source IDs from hosted LLM output.
+    """Extracts clean markdown answer text and cited source IDs from hosted LLM output.
     Supports JSON output format {"answer": "...", "source_ids": [...]},
-    with robust fallbacks for markdown code fences and entity mentions.
+    with robust unescaping, dirty-JSON repair, regex fallback, and internal term stripping.
     """
     text = (raw_output or "").strip()
     clean_text = text
@@ -154,20 +193,20 @@ def parse_llm_response(
     answer: Optional[str] = None
     source_ids: List[str] = []
 
-    # 1. Attempt JSON Parsing
+    # 1. Attempt JSON Parsing with strict=False (allows unescaped control chars like \n)
     try:
-        data = json.loads(clean_text)
+        data = json.loads(clean_text, strict=False)
         if isinstance(data, dict):
             answer = str(data.get("answer", "")).strip()
             raw_sids = data.get("source_ids", [])
             if isinstance(raw_sids, list):
                 source_ids = [str(sid).strip() for sid in raw_sids if sid]
     except Exception:
-        # Check for JSON object embedded within response text
+        # 2. Check for JSON object embedded within response text
         json_match = re.search(r"\{[\s\S]*\"answer\"[\s\S]*\}", clean_text)
         if json_match:
             try:
-                data = json.loads(json_match.group(0))
+                data = json.loads(json_match.group(0), strict=False)
                 if isinstance(data, dict):
                     answer = str(data.get("answer", "")).strip()
                     raw_sids = data.get("source_ids", [])
@@ -176,15 +215,42 @@ def parse_llm_response(
             except Exception:
                 pass
 
-    # 2. Fallback: If answer is not parsed from JSON, treat raw text as answer
-    if not answer:
-        answer = text
+    # 3. Robust Regex Extraction fallback if JSON parsing failed due to unescaped quotes or malformed syntax
+    if not answer and ("\"answer\"" in clean_text or "'answer'" in clean_text):
+        m = re.search(r'["\']answer["\']\s*:\s*"([\s\S]*?)(?:"\s*,\s*["\']source_ids["\']|"\s*\})', clean_text)
+        if m:
+            answer = m.group(1).replace('\\"', '"').replace('\\n', '\n')
+            sm = re.search(r'["\']source_ids["\']\s*:\s*\[([\s\S]*?)\]', clean_text)
+            if sm:
+                source_ids = [re.sub(r'["\'\s]', '', x) for x in sm.group(1).split(',') if re.sub(r'["\'\s]', '', x)]
+        else:
+            m2 = re.search(r'["\']answer["\']\s*:\s*"([\s\S]*)', clean_text)
+            if m2:
+                raw_ans = m2.group(1).rstrip('"} \n\r\t')
+                answer = raw_ans.replace('\\"', '"').replace('\\n', '\n')
 
-    # 3. Check for "No context found" responses
+    # 4. Fallback: If text was not JSON at all, use clean_text as answer
+    if not answer:
+        if clean_text.startswith("{") and "answer" in clean_text:
+            cleaned_loose = re.sub(r'^\s*\{\s*["\']answer["\']\s*:\s*["\']?', '', clean_text)
+            cleaned_loose = re.sub(r'["\']?\s*(?:,\s*["\']source_ids["\']\s*:[\s\S]*?)?\s*\}\s*$', '', cleaned_loose)
+            answer = cleaned_loose.strip()
+        else:
+            answer = clean_text
+
+    # 5. Sanitize: ensure no leftover JSON artifact in answer
+    if answer.startswith('{"answer":') or answer.startswith('{\n  "answer":') or answer.startswith('{\n "answer":'):
+        answer = re.sub(r'^\s*\{\s*"answer"\s*:\s*"?', '', answer)
+        answer = re.sub(r'"?\s*\}?\s*$', '', answer).strip()
+
+    # 6. Apply Rule 3 & Rule 1: Clean internal RAG language and self-contradictions
+    answer = _clean_internal_rag_language(answer)
+
+    # 7. Check for "No context found" responses
     if NO_CONTEXT_DEFAULT_REPLY.lower() in answer.lower():
         return answer, []
 
-    # 4. Fallback: If no source_ids were extracted, match chunks via entity mentions in answer
+    # 8. Fallback: If no source_ids were extracted, match chunks via entity mentions in answer
     if not source_ids and retrieved_chunks:
         answer_lower = answer.lower()
         matched_ids: List[str] = []
@@ -240,12 +306,75 @@ class RAGService:
         retriever: Optional[Any] = None,
         llm_provider: Optional[BaseLLMProvider] = None,
         query_resolver: Optional[QueryResolver] = None,
+        llm_router: Optional[Any] = None,
     ):
         self.retriever = retriever or StructuredRetriever()
-        self.llm_provider = llm_provider or get_llm_provider()
+        self.llm_provider = llm_provider
         self.query_resolver = query_resolver or QueryResolver(
             entity_store=getattr(self.retriever, "entity_store", None)
         )
+        self.llm_router = llm_router or get_llm_router()
+
+    @staticmethod
+    def _is_source_relevant(chunk: RetrievalChunkItem, answer_text: str, question: str) -> bool:
+        """Enforces Rule 8: Source Relevance.
+        Prevents displaying unrelated department pages (e.g. Paediatrics for timings)
+        unless the source genuinely contributed to the answer.
+        """
+        ans_lower = (answer_text or "").lower()
+        q_lower = (question or "").lower()
+        meta = chunk.metadata or {}
+        section_lower = (chunk.section or "").lower()
+        title_lower = (chunk.title or "").lower()
+        ctype = str(meta.get("content_type", "")).lower()
+
+        # If answer is 'No context found', reject all sources
+        if NO_CONTEXT_DEFAULT_REPLY.lower() in ans_lower or "couldn't find that information" in ans_lower:
+            # If related info was given (e.g. visiting hours unavailable but registration hours given):
+            if not any(k in ans_lower for k in ("registration", "op consultation", "contact", "timing", "schedule")):
+                return False
+
+        # Doctor match: only if doctor is mentioned in answer or question
+        doc_name = meta.get("doctor_name")
+        if doc_name:
+            clean_doc = re.sub(r"^(?:dr\.?|sr\.?)\s*", "", doc_name.lower()).strip()
+            return bool(clean_doc and (clean_doc in ans_lower or clean_doc in q_lower or doc_name.lower() in ans_lower))
+
+        # Timing / Visiting / Schedule queries:
+        is_timing_query = any(k in q_lower or k in ans_lower for k in ("timing", "visiting", "hour", "schedule", "registration", "opd"))
+        if is_timing_query:
+            # Reject any specialized medical departments unless specifically mentioned in the answer
+            dept_keywords = ("paediatrics", "neonatology", "cardiology", "orthopaedics", "general surgery", "ent", "gynaecology", "dental", "dermatology")
+            if any(d in section_lower for d in dept_keywords):
+                return any(d in ans_lower for d in dept_keywords if d in section_lower)
+
+            timing_terms = ("registration", "opd", "op consultation", "timing", "hours", "contact", "schedule", "visiting")
+            if any(term in section_lower for term in timing_terms):
+                return True
+            return False
+
+        # Department sources: only if department is mentioned in answer or question
+        if ctype == "department" or "department" in title_lower:
+            dept = meta.get("department", chunk.section or "")
+            if dept and dept.lower() != "general":
+                return dept.lower() in ans_lower or dept.lower() in q_lower
+            return False
+
+        # Facility sources: only if facility is mentioned
+        if ctype == "facility":
+            fac = meta.get("facility_name")
+            return bool(fac and (fac.lower() in ans_lower or fac.lower() in q_lower))
+
+        # Contact / Location queries
+        if any(k in q_lower for k in ("contact", "phone", "email", "address", "location", "where")):
+            if any(k in section_lower or k in title_lower for k in ("contact", "location", "address", "about", "overview")):
+                return True
+
+        # General text matching
+        if section_lower and section_lower not in ("general", "website") and section_lower in ans_lower:
+            return True
+
+        return False
 
     def answer_question(
         self,
@@ -257,9 +386,11 @@ class RAGService:
         min_score: Optional[float] = None,
         namespace: Optional[str] = None,
         debug: Optional[bool] = False,
+        input_type: Optional[str] = "text",
     ) -> ChatResponse:
         """Processes patient question, resolves conversational follow-ups, retrieves factual
-        context, queries hosted LLM, and returns grounded answer with source citations.
+        context, queries hosted LLM via router (Groq for text, Gemini for voice), and returns
+        grounded answer with source citations.
         
         Args:
             message: User's question or message.
@@ -270,6 +401,7 @@ class RAGService:
             min_score: Minimum similarity score cutoff.
             namespace: Hospital namespace partition.
             debug: Optional flag to return detailed development diagnostics.
+            input_type: Input modality: 'text' or 'voice'.
             
         Returns:
             ChatResponse: Pydantic model with answer string, sources, session_id, resolved_query,
@@ -390,8 +522,15 @@ class RAGService:
                 }
                 for r in (retrieval_response.results or [])
             ]
+            active_provider = (
+                "custom"
+                if self.llm_provider is not None
+                else ("gemini" if (input_type or "").lower() == "voice" else "groq")
+            )
             debug_pipeline_data = {
                 "raw_transcript": clean_msg,
+                "input_type": input_type or "text",
+                "llm_provider": active_provider,
                 "language": getattr(resolution, "language", target_lang),
                 "normalized_query": resolved_query,
                 "intent": str(resolution.intent),
@@ -438,12 +577,24 @@ class RAGService:
             language=target_lang,
         )
 
-        # 7. Generate Answer via Hosted LLM Provider
-        logger.info("Calling hosted LLM provider to generate grounded conversational answer...")
-        raw_llm_output = self.llm_provider.generate(
-            system_instruction=HOSPITAL_SYSTEM_INSTRUCTION,
-            user_message=user_prompt,
-        )
+        # 7. Generate Answer via Hosted LLM Provider or Router
+        norm_input_type = (input_type or "text").strip().lower()
+        if self.llm_provider is not None:
+            logger.info("Calling configured LLM provider to generate grounded conversational answer...")
+            raw_llm_output = self.llm_provider.generate(
+                system_instruction=HOSPITAL_SYSTEM_INSTRUCTION,
+                user_message=user_prompt,
+            )
+        else:
+            logger.info(
+                "Calling LLM Router to generate grounded answer for input_type=%s...",
+                norm_input_type,
+            )
+            raw_llm_output = self.llm_router.generate(
+                input_type=norm_input_type,
+                system_prompt=HOSPITAL_SYSTEM_INSTRUCTION,
+                user_prompt=user_prompt,
+            )
 
         # 8. Parse LLM Answer and Source IDs
         answer_text, cited_source_ids = parse_llm_response(
@@ -451,15 +602,23 @@ class RAGService:
             retrieved_chunks=retrieval_response.results,
         )
 
-        # 9. Map Selected Source IDs to Original Trusted Metadata
+        # 9. Map Selected Source IDs to Original Trusted Metadata with Relevance Filtering (Rule 8)
         chunks_by_id: Dict[str, RetrievalChunkItem] = {
             chunk.chunk_id: chunk for chunk in retrieval_response.results
         }
 
         raw_selected_sources: List[SourceItem] = []
+        is_timing_q = any(k in clean_msg.lower() or k in answer_text.lower() for k in ("timing", "visiting", "hour", "schedule", "registration", "opd"))
+        dept_keywords = ("paediatrics", "neonatology", "cardiology", "orthopaedics", "general surgery", "ent", "gynaecology", "dental", "dermatology")
+
         for s_id in cited_source_ids:
             chunk = chunks_by_id.get(s_id)
             if chunk:
+                sec_low = (chunk.section or "").lower()
+                # Rule 8: If timing query, reject specialized departments unless mentioned in answer
+                if is_timing_q and any(d in sec_low for d in dept_keywords) and not any(d in answer_text.lower() for d in dept_keywords):
+                    continue
+
                 meta = chunk.metadata or {}
                 doc_name = format_doctor_display_name(meta.get("doctor_name"))
                 dept = meta.get("department", chunk.section)
@@ -477,11 +636,16 @@ class RAGService:
                     )
                 )
 
-        # Fallback if cited IDs did not match candidate IDs
+        # Fallback if cited IDs did not match candidate IDs or were not returned
         if not raw_selected_sources and retrieval_response.results and NO_CONTEXT_DEFAULT_REPLY.lower() not in answer_text.lower():
             seen_cids = set()
             for chunk in retrieval_response.results:
                 if chunk.chunk_id not in seen_cids:
+                    sec_low = (chunk.section or "").lower()
+                    # Rule 8: If timing query, reject specialized departments unless mentioned in answer
+                    if is_timing_q and any(d in sec_low for d in dept_keywords) and not any(d in answer_text.lower() for d in dept_keywords):
+                        continue
+
                     seen_cids.add(chunk.chunk_id)
                     meta = chunk.metadata or {}
                     doc_name = format_doctor_display_name(meta.get("doctor_name"))

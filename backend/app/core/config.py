@@ -31,7 +31,13 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "openai"
     OPENAI_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
-    LLM_MODEL: str = "gpt-4o-mini"
+    GEMINI_API_KEY_1: Optional[str] = None
+    GEMINI_API_KEY_2: Optional[str] = None
+    GEMINI_API_KEY_3: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-flash-lite-latest"
+    GROQ_API_KEY: Optional[str] = None
+    GROQ_MODEL: str = "openai/gpt-oss-20b"
+    LLM_MODEL: str = "gemini-flash-lite-latest"
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_OUTPUT_TOKENS: int = 800
     MAX_HISTORY_MESSAGES: int = 10

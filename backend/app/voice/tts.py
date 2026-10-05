@@ -1,4 +1,4 @@
-"""Text-to-Speech (TTS) implementation using Google's Gemini API.
+"""Text-to-Speech (TTS) implementation using Google's Gemini API with 3-key fallback.
 Converts hospital assistant answers to playable WAV audio in English, Malayalam, and Hindi.
 """
 import base64
@@ -6,12 +6,13 @@ import io
 import re
 import time
 import wave
-from typing import Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import httpx
 
 from app.core.config import settings
 from app.core.logging_config import logger
+from app.services.gemini_key_manager import GeminiKeyManager, get_gemini_key_manager
 from app.voice.language import (
     LANG_EN,
     LANG_HI,
@@ -21,17 +22,25 @@ from app.voice.language import (
 
 
 class GeminiTTS:
-    """Gemini Text-to-Speech provider synthesizing audio via Gemini speech generation."""
+    """Gemini Text-to-Speech provider synthesizing audio with multi-key fallback."""
 
-    def __init__(self, api_key: Optional[str] = None):
-        raw_key = api_key or settings.GEMINI_API_KEY or settings.OPENAI_API_KEY
-        self.api_key = raw_key.strip() if raw_key else None
-        # Models with active TTS support
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        key_manager: Optional[GeminiKeyManager] = None,
+        client: Optional[Any] = None,
+    ):
+        if api_key:
+            self.key_manager = GeminiKeyManager(keys=[(1, api_key)])
+        else:
+            self.key_manager = key_manager or get_gemini_key_manager()
+
+        # Models with active Gemini TTS support
         self.candidate_models = [
             "gemini-2.5-flash-preview-tts",
-            "gemini-3.1-flash-tts-preview",
             "gemini-2.5-pro-preview-tts",
         ]
+        self._client = client
 
     def _clean_text_for_speech(self, text: str) -> str:
         """Removes markdown symbols, URLs, and source tags for natural speech flow."""
@@ -80,12 +89,26 @@ class GeminiTTS:
 
         return wav_buffer.getvalue()
 
+    def _verify_audio_payload(self, raw_pcm: bytes, wav_data: bytes, model: str) -> None:
+        """Enforces empty audio protection by validating bytes, length, and RIFF container."""
+        if not raw_pcm or len(raw_pcm) == 0:
+            logger.error("TTS audio verification failure: raw PCM audio payload is empty (model=%s).", model)
+            raise ValueError("Gemini TTS returned empty PCM audio bytes.")
+
+        if not wav_data or len(wav_data) < 44:
+            logger.error("TTS audio verification failure: WAV data too short (<44 bytes) (model=%s).", model)
+            raise ValueError("Gemini TTS produced an incomplete WAV audio container.")
+
+        if not wav_data.startswith(b"RIFF"):
+            logger.error("TTS audio verification failure: WAV header missing RIFF magic bytes (model=%s).", model)
+            raise ValueError("Gemini TTS audio container is corrupt (missing RIFF header).")
+
     def synthesize(
         self,
         text: str,
         language: Optional[str] = LANG_EN,
     ) -> Tuple[bytes, str]:
-        """Synthesizes given text into playable WAV audio.
+        """Synthesizes given text into playable WAV audio using resilient Gemini key fallback.
         
         Args:
             text: Text to read aloud.
@@ -94,18 +117,13 @@ class GeminiTTS:
         Returns:
             Tuple[bytes, str]: (WAV audio binary data, MIME type 'audio/wav').
         """
-        if not self.api_key:
-            raise ValueError(
-                "Gemini API key is not configured. Please set GEMINI_API_KEY in backend/.env."
-            )
-
         speech_text = self._clean_text_for_speech(text)
         if not speech_text:
             raise ValueError("Input text is empty after cleaning.")
 
         resolved_lang = resolve_language(language, speech_text)
 
-        # Choose natural voice for the target language
+        # Choose natural prebuilt voice for target language
         voice_name = "Puck"
         if resolved_lang == LANG_ML:
             voice_name = "Kore"
@@ -134,60 +152,110 @@ class GeminiTTS:
             },
         }
 
-        last_error = None
-        for model in self.candidate_models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
-            start_time = time.time()
-            try:
-                with httpx.Client(timeout=25.0) as client:
-                    resp = client.post(url, json=payload)
-                    duration = time.time() - start_time
+        def _perform_tts(api_key: str, key_slot: int) -> Tuple[bytes, str]:
+            # Log selected key slot index ONLY (NEVER the actual API key)
+            logger.info("Gemini key slot: %d", key_slot)
 
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        candidates = data.get("candidates", [])
-                        if not candidates:
-                            continue
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        if not parts:
-                            continue
+            last_attempt_err = None
+            for model in self.candidate_models:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                headers = {"x-goog-api-key": api_key}
+                start_time = time.time()
+                try:
+                    client_ctx = httpx.Client(timeout=25.0) if self._client is None else self._client
+                    with client_ctx as client:
+                        resp = client.post(url, headers=headers, json=payload)
+                        duration = time.time() - start_time
 
-                        inline_data = parts[0].get("inlineData")
-                        if not inline_data or "data" not in inline_data:
-                            continue
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            candidates = data.get("candidates", [])
+                            if not candidates:
+                                logger.warning("Gemini TTS response missing candidates list (model=%s, slot=%d).", model, key_slot)
+                                continue
 
-                        raw_b64 = inline_data["data"]
-                        raw_pcm = base64.b64decode(raw_b64)
-                        wav_data = self._convert_pcm_to_wav(raw_pcm, sample_rate=24000)
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if not parts:
+                                logger.warning("Gemini TTS response missing content parts (model=%s, slot=%d).", model, key_slot)
+                                continue
 
-                        logger.info(
-                            "Gemini TTS succeeded in %.3fs using %s (chars=%d, bytes=%d, lang=%s).",
-                            duration,
+                            inline_data = parts[0].get("inlineData")
+                            if not inline_data or "data" not in inline_data:
+                                logger.warning("Gemini TTS response missing inlineData (model=%s, slot=%d).", model, key_slot)
+                                continue
+
+                            raw_b64 = inline_data["data"]
+                            raw_pcm = base64.b64decode(raw_b64)
+                            wav_data = self._convert_pcm_to_wav(raw_pcm, sample_rate=24000)
+
+                            # Enforce empty audio protection
+                            self._verify_audio_payload(raw_pcm, wav_data, model)
+
+                            logger.info(
+                                "Gemini TTS succeeded in %.3fs: model=%s key_slot=%d chars=%d bytes=%d lang=%s.",
+                                duration,
+                                model,
+                                key_slot,
+                                len(speech_text),
+                                len(wav_data),
+                                resolved_lang,
+                            )
+                            return wav_data, "audio/wav"
+
+                        # Handle HTTP error statuses
+                        logger.warning(
+                            "Gemini TTS model %s returned status %d on key slot %d: %s",
                             model,
-                            len(speech_text),
-                            len(wav_data),
-                            resolved_lang,
+                            resp.status_code,
+                            key_slot,
+                            resp.text[:200],
                         )
-                        return wav_data, "audio/wav"
 
-                    elif resp.status_code in (429, 503):
-                        logger.warning("Gemini TTS model %s busy (HTTP %d). Trying next model...", model, resp.status_code)
-                        last_error = RuntimeError(f"Gemini TTS model {model} temporarily busy.")
+                        # Trigger key manager fallback on retryable status codes
+                        if resp.status_code in (401, 403, 429, 500, 502, 503, 504):
+                            provider_msg = None
+                            try:
+                                data = resp.json()
+                                if isinstance(data, dict):
+                                    err_dict = data.get("error", {})
+                                    if isinstance(err_dict, dict):
+                                        provider_msg = err_dict.get("message")
+                                    elif isinstance(err_dict, str):
+                                        provider_msg = err_dict
+                            except Exception:
+                                pass
+                            if not provider_msg and hasattr(resp, "text"):
+                                provider_msg = resp.text[:400]
+                            err = httpx.HTTPStatusError(f"HTTP {resp.status_code}: {provider_msg}", request=resp.request, response=resp)
+                            err.provider_message = provider_msg
+                            raise err
+
+                        # Non-retryable 4xx on this model: try next candidate model
+                        last_attempt_err = RuntimeError(f"Gemini TTS error (status {resp.status_code}): {resp.text[:150]}")
                         continue
-                    else:
-                        logger.warning("Gemini TTS model %s error %d: %s", model, resp.status_code, resp.text[:200])
-                        last_error = RuntimeError(f"Gemini TTS error (status {resp.status_code}).")
-                        continue
 
-            except httpx.TimeoutException:
-                logger.warning("Gemini TTS model %s timed out. Trying next model...", model)
-                last_error = TimeoutError("Gemini TTS request timed out.")
-                continue
-            except Exception as err:
-                logger.warning("Gemini TTS model %s failed: %s", model, err)
-                last_error = err
-                continue
+                except (httpx.TimeoutException, TimeoutError) as err:
+                    logger.warning("Gemini TTS model %s timed out on key slot %d.", model, key_slot)
+                    last_attempt_err = err
+                    raise  # Let key manager catch and retry on next slot
 
-        if last_error:
-            raise last_error
-        raise RuntimeError("Failed to synthesize audio with Gemini TTS.")
+                except httpx.HTTPStatusError as err:
+                    # Retryable HTTP status error: raise to key manager for slot fallback
+                    raise
+
+                except Exception as err:
+                    logger.warning("Gemini TTS model %s failed on key slot %d: %s", model, key_slot, err)
+                    last_attempt_err = err
+                    continue
+
+            if last_attempt_err:
+                raise last_attempt_err
+            raise RuntimeError(f"Gemini TTS failed across all candidate models on key slot {key_slot}.")
+
+        return self.key_manager.execute_with_fallback(
+            func=_perform_tts,
+            operation_name="Gemini TTS",
+            model=self.candidate_models[0],
+            language=resolved_lang,
+            text_length=len(speech_text),
+        )

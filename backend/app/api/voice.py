@@ -103,14 +103,26 @@ def synthesize_voice(request: VoiceSynthesizeRequest) -> Response:
         logger.warning("Voice synthesis validation error: %s", err)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(err))
     except TimeoutError as err:
-        logger.warning("Voice synthesis timed out: %s", err)
+        logger.warning("Voice synthesis timed out across all keys: %s", err)
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Speech synthesis request timed out.",
+            detail="Speech synthesis request timed out. Please try again.",
+        )
+    except ConnectionError as err:
+        logger.error("Voice synthesis connection error: %s", err)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The voice synthesis service is temporarily unreachable. Please check network connectivity.",
         )
     except Exception as err:
-        logger.exception("Voice synthesis failed: %s", err)
+        logger.exception("Voice synthesis failed with %s: %s", type(err).__name__, err)
+        err_msg = str(err)
+        if any(term in err_msg.lower() for term in ("quota", "429", "rate limit", "resource_exhausted")):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Voice synthesis service quota exceeded across all configured API keys. Please try again shortly.",
+            )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to synthesize voice response. Please try again.",
+            detail=f"Failed to synthesize voice response: {err_msg}",
         )

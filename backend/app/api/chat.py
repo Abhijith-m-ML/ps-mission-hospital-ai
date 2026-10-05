@@ -33,6 +33,7 @@ def chat_endpoint(request: ChatRequest) -> ChatResponse:
             session_id=request.session_id,
             language=request.language,
             debug=getattr(request, "debug", False),
+            input_type=getattr(request, "input_type", "text") or "text",
         )
         return response
 
@@ -58,5 +59,5 @@ def chat_endpoint(request: ChatRequest) -> ChatResponse:
         logger.exception("Unexpected error processing chat message: %s", err)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An error occurred while generating the hospital response. Please try again later.",
+            detail="Sorry, I couldn't generate a response right now. Please try again.",
         )

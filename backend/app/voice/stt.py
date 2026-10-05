@@ -9,6 +9,7 @@ import httpx
 
 from app.core.config import settings
 from app.core.logging_config import logger
+from app.services.gemini_key_manager import GeminiKeyManager, get_gemini_key_manager
 from app.voice.language import (
     LANG_AUTO,
     LANG_EN,
@@ -20,15 +21,21 @@ from app.voice.language import (
 
 
 class GeminiSTT:
-    """Gemini Speech-to-Text provider leveraging native audio multimodal understanding."""
+    """Gemini Speech-to-Text provider leveraging native audio multimodal understanding with multi-key fallback."""
 
-    def __init__(self, api_key: Optional[str] = None):
-        raw_key = api_key or settings.GEMINI_API_KEY or settings.OPENAI_API_KEY
-        self.api_key = raw_key.strip() if raw_key else None
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        key_manager: Optional[GeminiKeyManager] = None,
+    ):
+        if api_key:
+            self.key_manager = GeminiKeyManager(keys=[(1, api_key)])
+        else:
+            self.key_manager = key_manager or get_gemini_key_manager()
+
         # Models with active audio support in Generative Language API
         self.candidate_models = [
             "gemini-flash-lite-latest",
-            "gemini-3.1-flash-lite",
             "gemini-flash-latest",
         ]
 
@@ -71,11 +78,6 @@ class GeminiSTT:
         Returns:
             Tuple[str, str]: (Transcribed text, detected/confirmed language code).
         """
-        if not self.api_key:
-            raise ValueError(
-                "Gemini API key is not configured. Please set GEMINI_API_KEY in backend/.env."
-            )
-
         if not audio_bytes or len(audio_bytes) < 100:
             raise ValueError("Audio payload is empty or too short to transcribe.")
 
@@ -134,66 +136,83 @@ class GeminiSTT:
             },
         }
 
-        last_error = None
-        for model in self.candidate_models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
-            start_time = time.time()
-            try:
-                with httpx.Client(timeout=25.0) as client:
-                    resp = client.post(url, json=payload)
-                    duration = time.time() - start_time
+        def _perform_stt(api_key: str, key_slot: int) -> Tuple[str, str]:
+            logger.info("Gemini key slot: %d", key_slot)
+            last_error = None
+            for model in self.candidate_models:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                headers = {"x-goog-api-key": api_key}
+                start_time = time.time()
+                try:
+                    with httpx.Client(timeout=25.0) as client:
+                        resp = client.post(url, headers=headers, json=payload)
+                        duration = time.time() - start_time
 
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        candidates = data.get("candidates", [])
-                        if not candidates:
-                            continue
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        if not parts:
-                            continue
-                        raw_text = parts[0].get("text", "").strip()
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            candidates = data.get("candidates", [])
+                            if not candidates:
+                                continue
+                            parts = candidates[0].get("content", {}).get("parts", [])
+                            if not parts:
+                                continue
+                            raw_text = parts[0].get("text", "").strip()
 
-                        # Strip markdown quotes or conversational prefixes if present
-                        cleaned_text = raw_text.strip('"`\'\n ')
-                        if cleaned_text.lower().startswith("transcript:"):
-                            cleaned_text = cleaned_text[len("transcript:"):].strip()
-                        elif cleaned_text.lower().startswith("transcription:"):
-                            cleaned_text = cleaned_text[len("transcription:"):].strip()
+                            cleaned_text = raw_text.strip('"`\'\n ')
+                            if cleaned_text.lower().startswith("transcript:"):
+                                cleaned_text = cleaned_text[len("transcript:"):].strip()
+                            elif cleaned_text.lower().startswith("transcription:"):
+                                cleaned_text = cleaned_text[len("transcription:"):].strip()
 
-                        logger.info(
-                            "Gemini STT succeeded in %.3fs using %s (bytes=%d, mime=%s).",
-                            duration,
+                            logger.info(
+                                "Gemini STT succeeded in %.3fs using %s on key slot %d (bytes=%d, mime=%s).",
+                                duration,
+                                model,
+                                key_slot,
+                                len(audio_bytes),
+                                resolved_mime,
+                            )
+
+                            detected_lang = detect_language(cleaned_text)
+                            final_lang = resolve_language(language, cleaned_text)
+                            if final_lang == LANG_EN and detected_lang != LANG_EN:
+                                final_lang = detected_lang
+
+                            return cleaned_text, final_lang
+
+                        logger.warning(
+                            "Gemini STT model %s returned status %d on key slot %d: %s",
                             model,
-                            len(audio_bytes),
-                            resolved_mime,
+                            resp.status_code,
+                            key_slot,
+                            resp.text[:200],
                         )
 
-                        # Determine language of transcribed text
-                        detected_lang = detect_language(cleaned_text)
-                        final_lang = resolve_language(language, cleaned_text)
-                        if final_lang == LANG_EN and detected_lang != LANG_EN:
-                            final_lang = detected_lang
+                        if resp.status_code in (401, 403, 429, 500, 502, 503, 504):
+                            resp.raise_for_status()
 
-                        return cleaned_text, final_lang
-
-                    elif resp.status_code in (429, 503):
-                        logger.warning("Gemini STT model %s busy (HTTP %d). Trying next model...", model, resp.status_code)
-                        last_error = RuntimeError(f"Gemini model {model} temporarily busy.")
-                        continue
-                    else:
-                        logger.warning("Gemini STT model %s error %d: %s", model, resp.status_code, resp.text[:200])
                         last_error = RuntimeError(f"Gemini STT error (status {resp.status_code}).")
                         continue
 
-            except httpx.TimeoutException:
-                logger.warning("Gemini STT model %s timed out. Trying next model...", model)
-                last_error = TimeoutError("Gemini STT request timed out.")
-                continue
-            except Exception as err:
-                logger.warning("Gemini STT model %s failed: %s", model, err)
-                last_error = err
-                continue
+                except (httpx.TimeoutException, TimeoutError) as err:
+                    logger.warning("Gemini STT model %s timed out on key slot %d.", model, key_slot)
+                    last_error = err
+                    raise
+                except httpx.HTTPStatusError as err:
+                    raise
+                except Exception as err:
+                    logger.warning("Gemini STT model %s failed on key slot %d: %s", model, key_slot, err)
+                    last_error = err
+                    continue
 
-        if last_error:
-            raise last_error
-        raise RuntimeError("Failed to transcribe audio with Gemini STT.")
+            if last_error:
+                raise last_error
+            raise RuntimeError(f"Failed to transcribe audio with Gemini STT across models on key slot {key_slot}.")
+
+        return self.key_manager.execute_with_fallback(
+            func=_perform_stt,
+            operation_name="Gemini STT",
+            model=self.candidate_models[0],
+            language=language,
+            text_length=len(audio_bytes),
+        )

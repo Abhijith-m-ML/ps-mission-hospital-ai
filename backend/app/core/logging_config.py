@@ -22,6 +22,11 @@ def setup_logging() -> logging.Logger:
     
     logger = logging.getLogger(settings.PROJECT_NAME)
     logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
+
+    # Silence third-party HTTP client logs to prevent accidental URL/key leakage
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     return logger
 
 

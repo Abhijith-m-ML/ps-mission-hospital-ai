@@ -64,7 +64,7 @@ class EntityExtractor:
         "headache": [
             "headache", "head ache", "head pain", "pain in head", "migraine",
             "തലവേദന", "തലയിൽ വേദന", "തലവേദനയുണ്ട്", "തലവേദനയാണ്",
-            "thala vedana", "thalavedana", "thala pain",
+            "thala vedana", "thalavedana", "thala pain", "thalavali", "thala vali", "thalavaly",
         ],
         "stomach pain": [
             "stomach pain", "stomach ache", "belly pain", "abdominal pain", "tummy ache",

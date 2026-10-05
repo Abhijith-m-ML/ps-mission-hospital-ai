@@ -363,6 +363,10 @@ class ChatRequest(BaseModel):
         default=False,
         description="Enable development debug pipeline trace in response",
     )
+    input_type: Optional[str] = Field(
+        default="text",
+        description="Input modality: 'text' or 'voice' (determines LLM routing)",
+    )
 
 
 class VoiceTranscribeResponse(BaseModel):

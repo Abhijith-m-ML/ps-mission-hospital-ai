@@ -349,8 +349,29 @@ const markdownComponents = {
 export default function AssistantResponse({ text, sources = [], userQuestion = "" }) {
   if (!text) return null;
 
+  // Defensive unpacking: Ensure raw JSON string never renders in the chat UI
+  let sanitizedText = String(text).trim();
+  if (sanitizedText.startsWith("{") && (sanitizedText.includes('"answer"') || sanitizedText.includes("'answer'"))) {
+    try {
+      const parsed = JSON.parse(sanitizedText);
+      if (parsed && parsed.answer) {
+        sanitizedText = String(parsed.answer);
+      }
+    } catch {
+      const match = sanitizedText.match(/["']answer["']\s*:\s*"([\s\S]*?)(?:"\s*,\s*["']source_ids["']|"\s*\})/);
+      if (match) {
+        sanitizedText = match[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+      } else {
+        const looseMatch = sanitizedText.match(/["']answer["']\s*:\s*"([\s\S]*)/);
+        if (looseMatch) {
+          sanitizedText = looseMatch[1].replace(/["'}\s]+$/, '').replace(/\\"/g, '"').replace(/\\n/g, '\n');
+        }
+      }
+    }
+  }
+
   // 1. Separate Medical Disclaimer if present
-  const { mainText, disclaimer } = extractDisclaimer(text);
+  const { mainText, disclaimer } = extractDisclaimer(sanitizedText);
 
   // 2. Extract Structured Doctor Cards
   const { remainingText, doctors } = extractDoctors(mainText, sources);

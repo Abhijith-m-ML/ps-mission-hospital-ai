@@ -4,6 +4,7 @@ from typing import Any, Optional
 
 from app.core.config import settings
 from app.core.logging_config import logger
+from app.services.gemini_key_manager import GeminiKeyManager, get_gemini_key_manager
 
 
 class BaseLLMProvider(ABC):
@@ -162,84 +163,60 @@ class OpenAILLMProvider(BaseLLMProvider):
 
 
 class GeminiLLMProvider(BaseLLMProvider):
-    """Google Gemini hosted LLM provider using the Generative Language REST API."""
+    """Google Gemini hosted LLM provider using the Generative Language REST API with multi-key fallback."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
+        key_manager: Optional[Any] = None,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_output_tokens: Optional[int] = None,
     ):
-        raw_key = api_key or settings.GEMINI_API_KEY or settings.OPENAI_API_KEY
-        self.api_key = raw_key.strip() if raw_key else None
-        
+        from app.services.gemini_key_manager import GeminiKeyManager, get_gemini_key_manager
+        if api_key:
+            self.key_manager = GeminiKeyManager(keys=[(1, api_key)])
+        else:
+            self.key_manager = key_manager or get_gemini_key_manager()
+
         # Default model for Gemini
-        default_model = "gemini-flash-lite-latest"
-        cfg_model = settings.LLM_MODEL or ""
+        default_model = "gemini-flash-latest"
+        cfg_model = getattr(settings, "GEMINI_MODEL", None) or settings.LLM_MODEL or ""
         self.model = model or (cfg_model if "gemini" in cfg_model.lower() else default_model)
         self.temperature = temperature if temperature is not None else settings.LLM_TEMPERATURE
         self.max_tokens = max_output_tokens or settings.LLM_MAX_OUTPUT_TOKENS
 
     def generate(self, system_instruction: str, user_message: str) -> str:
-        """Sends the grounded prompt to Google's hosted Gemini API with automatic fallback."""
-        if not self.api_key:
-            raise ValueError(
-                "Gemini API key is missing. Please set GEMINI_API_KEY in backend/.env "
-                "or configure it in your deployment environment."
-            )
-
+        """Sends the grounded prompt to Google's hosted Gemini API with automatic key fallback."""
         import httpx
 
-        candidate_models = [self.model]
-        if "gemini-flash-lite-latest" not in candidate_models:
-            candidate_models.append("gemini-flash-lite-latest")
+        payload_base = {
+            "system_instruction": {
+                "parts": [{"text": system_instruction}]
+            },
+            "contents": [
+                {"parts": [{"text": user_message}]}
+            ],
+            "generationConfig": {
+                "temperature": self.temperature,
+                "maxOutputTokens": self.max_tokens,
+            },
+        }
 
-        last_error = None
-        for current_model in candidate_models:
+        def _perform_generate(api_key: str, key_slot: int) -> str:
+            logger.info("Gemini key slot: %d", key_slot)
             start_time = time.time()
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{current_model}:generateContent?key={self.api_key}"
+                f"{self.model}:generateContent"
             )
-            payload = {
-                "system_instruction": {
-                    "parts": [{"text": system_instruction}]
-                },
-                "contents": [
-                    {"parts": [{"text": user_message}]}
-                ],
-                "generationConfig": {
-                    "temperature": self.temperature,
-                    "maxOutputTokens": self.max_tokens,
-                },
-            }
+            headers = {"x-goog-api-key": api_key}
 
-            try:
-                with httpx.Client(timeout=30.0) as client:
-                    resp = client.post(url, json=payload)
-                    duration = time.time() - start_time
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(url, headers=headers, json=payload_base)
+                duration = time.time() - start_time
 
-                    if resp.status_code == 400:
-                        data = resp.json()
-                        msg = data.get("error", {}).get("message", "Invalid request to Gemini API")
-                        logger.error("Gemini API 400 Bad Request: %s", msg)
-                        raise ValueError(f"Gemini API error: {msg}")
-                    elif resp.status_code in (401, 403):
-                        logger.error("Gemini authentication failure (status %d)", resp.status_code)
-                        raise ValueError(
-                            "Invalid Gemini API key. Please verify your GEMINI_API_KEY configuration."
-                        )
-                    elif resp.status_code in (429, 503):
-                        logger.warning("Gemini model '%s' busy or overloaded (HTTP %d). Trying fallback...", current_model, resp.status_code)
-                        last_error = RuntimeError(f"Gemini model {current_model} is temporarily unavailable (HTTP {resp.status_code}).")
-                        continue
-                    elif resp.status_code != 200:
-                        logger.error("Gemini API error status %d: %s", resp.status_code, resp.text)
-                        raise RuntimeError(
-                            f"The AI service encountered an error (HTTP {resp.status_code})."
-                        )
-
+                if resp.status_code == 200:
                     data = resp.json()
                     candidates = data.get("candidates", [])
                     if not candidates:
@@ -250,19 +227,58 @@ class GeminiLLMProvider(BaseLLMProvider):
                         raise ValueError("Gemini candidate contains no content parts.")
 
                     content = parts[0].get("text", "") or ""
-                    logger.info("Gemini API succeeded in %.3fs (model=%s).", duration, current_model)
+                    logger.info(
+                        "Gemini API succeeded in %.3fs on key slot %d (model=%s).",
+                        duration,
+                        key_slot,
+                        self.model,
+                    )
                     return content.strip()
 
-            except httpx.TimeoutException as err:
-                logger.warning("Gemini model '%s' timed out. Trying fallback...", current_model)
-                last_error = TimeoutError("The request to the AI service timed out.")
-                continue
-            except httpx.ConnectError as err:
-                raise ConnectionError("Unable to connect to the hosted AI service. Please verify network access.") from err
+                # Non-200 responses: Safely extract provider error message
+                provider_msg = None
+                try:
+                    data = resp.json()
+                    if isinstance(data, dict):
+                        err_dict = data.get("error", {})
+                        if isinstance(err_dict, dict):
+                            provider_msg = err_dict.get("message") or err_dict.get("status")
+                        elif isinstance(err_dict, str):
+                            provider_msg = err_dict
+                        if not provider_msg and "message" in data:
+                            provider_msg = str(data["message"])
+                except Exception:
+                    pass
+                if not provider_msg and hasattr(resp, "text") and resp.text:
+                    provider_msg = resp.text[:400]
 
-        if last_error:
-            raise last_error
-        raise RuntimeError("Failed to generate response from Gemini.")
+                safe_provider_msg = str(provider_msg or "Unknown error from Gemini API")
+                if api_key and api_key in safe_provider_msg:
+                    safe_provider_msg = safe_provider_msg.replace(api_key, f"[REDACTED_GEMINI_KEY_{key_slot}]")
+
+                is_retryable = GeminiKeyManager.is_retryable_error(resp.status_code)
+
+                if resp.status_code == 400:
+                    err = ValueError(f"Gemini API 400 Bad Request: {safe_provider_msg}")
+                    err.status_code = 400
+                    err.provider_message = safe_provider_msg
+                    raise err
+
+                err = httpx.HTTPStatusError(
+                    f"HTTP {resp.status_code}: {safe_provider_msg}",
+                    request=resp.request,
+                    response=resp,
+                )
+                err.status_code = resp.status_code
+                err.provider_message = safe_provider_msg
+                raise err
+
+        return self.key_manager.execute_with_fallback(
+            func=_perform_generate,
+            operation_name="Gemini Generation",
+            model=self.model,
+            text_length=len(user_message),
+        )
 
 
 class MockLLMProvider(BaseLLMProvider):
@@ -281,22 +297,59 @@ class MockLLMProvider(BaseLLMProvider):
         return self.response_text
 
 
+class GroqLLMProvider(BaseLLMProvider):
+    """Groq hosted LLM provider wrapping GroqService."""
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_output_tokens: Optional[int] = None,
+        client: Optional[Any] = None,
+    ):
+        from app.services.groq_service import GroqService
+        self.service = GroqService(
+            api_key=api_key,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_output_tokens,
+            client=client,
+        )
+        self.model = self.service.model
+
+    def generate(self, system_instruction: str, user_message: str) -> str:
+        return self.service.generate_response(
+            system_prompt=system_instruction,
+            user_prompt=user_message,
+        )
+
+
 def get_llm_provider() -> BaseLLMProvider:
     """Factory creating the configured LLM provider according to settings.LLM_PROVIDER
     or auto-detected from key prefix.
     """
     provider_name = (settings.LLM_PROVIDER or "openai").lower()
-    
-    # Auto-detect if user provided a Google Gemini key (starts with AQ. or AIza)
-    active_key = settings.GEMINI_API_KEY or settings.OPENAI_API_KEY or ""
-    if provider_name == "gemini" or active_key.startswith(("AQ.", "AIza")):
+
+    if provider_name == "groq":
+        return GroqLLMProvider()
+    elif provider_name == "gemini":
         return GeminiLLMProvider()
     elif provider_name == "openai":
         return OpenAILLMProvider()
     elif provider_name == "mock":
         return MockLLMProvider()
+
+    # Auto-detect if user provided a Google Gemini key (starts with AQ. or AIza)
+    active_key = settings.GEMINI_API_KEY or settings.OPENAI_API_KEY or ""
+    if active_key.startswith(("AQ.", "AIza")):
+        return GeminiLLMProvider()
+    elif settings.GROQ_API_KEY:
+        return GroqLLMProvider()
+    elif settings.OPENAI_API_KEY:
+        return OpenAILLMProvider()
     else:
         raise ValueError(
-            f"Unsupported LLM_PROVIDER '{provider_name}'. Supported providers: 'openai', 'gemini', 'mock'."
+            f"Unsupported LLM_PROVIDER '{provider_name}'. Supported providers: 'groq', 'openai', 'gemini', 'mock'."
         )
 
